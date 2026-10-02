@@ -3,205 +3,222 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Daily Task Prioritization Agent", page_icon="📋")
-
+st.set_page_config(page_title="Procurement Task Prioritizer", page_icon="📋", layout="wide")
 st.title("📋 Daily Task Prioritization Agent")
-st.write("Load your task list from Google Sheets (or CSV) and generate a prioritized daily plan.")
+st.write("Load your procurement to-do sheet and get a prioritized plan for today.")
 
-# ---------- Sample data ----------
-sample_data = pd.DataFrame({
-    "Task": [
-        "Prepare monthly procurement report",
-        "Follow up with pending vendor invoices",
-        "Compare supplier quotations",
-        "Review quality complaints",
-        "Update supplier rate tracker"
-    ],
-    "Priority": ["High", "High", "High", "Medium", "Medium"],
-    "Due_Date": ["2026-10-02", "2026-10-02", "2026-10-02", "2026-10-03", "2026-10-03"],
-    "Estimated_Minutes": [90, 45, 60, 45, 60],
-    "Category": ["Finance", "Accounts", "Sourcing", "Quality", "Sourcing"]
-})
+# ---------- Column names in your sheet -> internal names ----------
+COLUMN_MAP = {
+    "date": "Date",
+    "to do list/work": "Task",
+    "vendor": "Vendor",
+    "category": "Category",
+    "initative": "Owner",       # your sheet's spelling
+    "initiative": "Owner",
+    "region/brand": "Region",
+    "remarks-1": "Remarks1",
+    "remarks-2": "Remarks2",
+    "completion/pending": "Status",
+    "summary": "Summary",
+}
 
-st.subheader("📥 Step 1: Sample Format")
-st.download_button(
-    label="⬇️ Download Sample Tasks CSV",
-    data=sample_data.to_csv(index=False),
-    file_name="sample_tasks.csv",
-    mime="text/csv"
-)
+# ---------- Scoring rules (edit these to suit your work) ----------
+# (keywords, priority points, default minutes) - the first match wins
+RULES = [
+    (["quality", "complaint"], 30, 45),
+    (["supply", "short receive", "credit note"], 30, 30),
+    (["payment", "invoice", "billing", "booking"], 30, 20),
+    (["price", "pricing", "priceing", "comparison", "oil"], 20, 40),
+    (["vendor code", "creation", "certificate", "gst", "data update"], 15, 20),
+    (["distributor", "required"], 15, 30),
+]
+DEFAULT_POINTS, DEFAULT_MINUTES = 10, 30
+
+
+def task_rule(row):
+    text = f"{row.get('Category', '')} {row.get('Task', '')}".lower()
+    for keywords, points, minutes in RULES:
+        if any(k in text for k in keywords):
+            return points, minutes
+    return DEFAULT_POINTS, DEFAULT_MINUTES
+
+
+def age_points(age_days):
+    if pd.isna(age_days):
+        return 10
+    if age_days >= 30:
+        return 50
+    if age_days >= 14:
+        return 40
+    if age_days >= 7:
+        return 30
+    if age_days >= 3:
+        return 20
+    if age_days >= 0:
+        return 10
+    return 0
+
+
+def clean_status(row):
+    text = f"{row.get('Status', '')} {row.get('Summary', '')}".lower()
+    if re.search(r"comp|done|closed", text):
+        return "Completed"
+    if "wip" in text or "progress" in text:
+        return "WIP"
+    return "Pending"
 
 
 # ---------- Google Sheet helpers ----------
-def sheet_to_csv_url(url: str):
-    """Convert a normal Google Sheets link into a CSV export link."""
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    if not match:
+def sheet_to_csv_url(url):
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if not m:
         return None
-    sheet_id = match.group(1)
-    gid_match = re.search(r"[#&?]gid=([0-9]+)", url)
-    gid = gid_match.group(1) if gid_match else "0"
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    g = re.search(r"[#&?]gid=([0-9]+)", url)
+    return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv&gid={g.group(1) if g else '0'}"
 
 
-@st.cache_data(ttl=60)  # re-fetches the sheet at most once a minute
-def load_sheet(csv_url: str) -> pd.DataFrame:
+@st.cache_data(ttl=60)
+def load_sheet(csv_url):
     return pd.read_csv(csv_url)
 
 
-# ---------- Step 2: choose data source ----------
-st.subheader("📤 Step 2: Load Your Tasks")
+# ---------- Load data ----------
+st.subheader("📤 Step 1: Load Your Tasks")
 source = st.radio("Where are your tasks?", ["Google Sheet link", "Upload CSV"], horizontal=True)
-
-df = None
+raw = None
 
 if source == "Google Sheet link":
-    sheet_url = st.text_input(
-        "Paste your Google Sheet link",
-        placeholder="https://docs.google.com/spreadsheets/d/.../edit?gid=0"
-    )
-    st.caption("Sharing must be set to 'Anyone with the link → Viewer'. "
-               "To use a specific tab, open that tab first and copy the link.")
-
+    sheet_url = st.text_input("Paste your Google Sheet link")
+    st.caption("Sharing must be 'Anyone with the link → Viewer'. Open the right tab before copying the link.")
     if sheet_url:
         csv_url = sheet_to_csv_url(sheet_url)
         if csv_url is None:
             st.error("That doesn't look like a Google Sheets link.")
         else:
             try:
-                df = load_sheet(csv_url)
+                raw = load_sheet(csv_url)
             except Exception:
-                st.error("Couldn't read the sheet. Check that sharing is set to "
-                         "'Anyone with the link' (Viewer) and the link is correct.")
+                st.error("Couldn't read the sheet. Check the sharing setting and the link.")
     if st.button("🔄 Refresh from sheet"):
         st.cache_data.clear()
         st.rerun()
 else:
-    uploaded_file = st.file_uploader("Choose your CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
+    up = st.file_uploader("Choose your CSV file", type=["csv"])
+    if up is not None:
+        raw = pd.read_csv(up)
 
 
-# ---------- Prioritization logic ----------
-PRIORITY_POINTS = {"high": 30, "medium": 20, "low": 10}
-
-
-def urgency_points(days_left):
-    if pd.isna(days_left):
-        return 0
-    if days_left < 0:
-        return 50   # overdue
-    if days_left == 0:
-        return 40   # due today
-    if days_left == 1:
-        return 30   # due tomorrow
-    if days_left <= 3:
-        return 20
-    if days_left <= 7:
-        return 10
-    return 0
-
-
-def build_plan(df, available_minutes, start_time):
+# ---------- Plan builder ----------
+def build_plan(df, as_of, available_minutes, start_time):
     df = df.copy()
-    today = pd.Timestamp.today().normalize()
 
-    df["Due_Date"] = pd.to_datetime(df["Due_Date"], errors="coerce")
-    df["Days_Left"] = (df["Due_Date"] - today).dt.days
-    df["Estimated_Minutes"] = pd.to_numeric(
-        df["Estimated_Minutes"], errors="coerce"
-    ).fillna(30)
+    # Dates are dd/mm/yy in your sheet
+    d = pd.to_datetime(df["Date"], format="%d/%m/%y", errors="coerce")
+    fallback = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df["Date_parsed"] = d.fillna(fallback)
+    df["Age_Days"] = (pd.Timestamp(as_of) - df["Date_parsed"]).dt.days
 
-    df["Priority_Points"] = (
-        df["Priority"].astype(str).str.strip().str.lower().map(PRIORITY_POINTS).fillna(10)
-    )
-    df["Urgency_Points"] = df["Days_Left"].apply(urgency_points)
-    df["Score"] = df["Priority_Points"] + df["Urgency_Points"]
+    rules = df.apply(task_rule, axis=1, result_type="expand")
+    df["Task_Points"] = rules[0]
+    if "Estimated_Minutes" in df.columns:
+        df["Est_Min"] = pd.to_numeric(df["Estimated_Minutes"], errors="coerce").fillna(rules[1])
+    else:
+        df["Est_Min"] = rules[1]
 
-    df = df.sort_values(
-        by=["Score", "Estimated_Minutes"], ascending=[False, True]
-    ).reset_index(drop=True)
+    df["Age_Points"] = df["Age_Days"].apply(age_points)
+    df["WIP_Bonus"] = (df["State"] == "WIP").astype(int) * 5
+    df["Score"] = df["Task_Points"] + df["Age_Points"] + df["WIP_Bonus"]
+    df["Priority"] = pd.cut(df["Score"], [-1, 44, 69, 1000], labels=["Low", "Medium", "High"])
+
+    df = df.sort_values(["Score", "Est_Min"], ascending=[False, True]).reset_index(drop=True)
     df.insert(0, "Rank", df.index + 1)
 
-    used = 0
-    current = start_time
-    statuses, starts, ends = [], [], []
-
-    for _, row in df.iterrows():
-        mins = int(row["Estimated_Minutes"])
+    used, current = 0, start_time
+    plan_col, starts, ends = [], [], []
+    for _, r in df.iterrows():
+        mins = int(r["Est_Min"])
         if used + mins <= available_minutes:
             end = current + timedelta(minutes=mins)
-            statuses.append("✅ Do Today")
+            plan_col.append("✅ Do Today")
             starts.append(current.strftime("%I:%M %p"))
             ends.append(end.strftime("%I:%M %p"))
-            current = end
-            used += mins
+            current, used = end, used + mins
         else:
-            statuses.append("⏭️ Defer")
+            plan_col.append("⏭️ Defer")
             starts.append("-")
             ends.append("-")
-
-    df["Status"] = statuses
-    df["Start"] = starts
-    df["End"] = ends
-    df["Due_Date"] = df["Due_Date"].dt.strftime("%Y-%m-%d")
+    df["Plan"], df["Start"], df["End"] = plan_col, starts, ends
+    df["Date"] = df["Date_parsed"].dt.strftime("%d/%m/%Y").fillna("invalid date")
     return df, used
 
 
 # ---------- App flow ----------
-if df is not None:
-    df.columns = df.columns.str.strip()          # remove stray spaces in headers
-    df = df.dropna(subset=["Task"]) if "Task" in df.columns else df
-
-    required = ["Task", "Priority", "Due_Date", "Estimated_Minutes"]
-    missing = [c for c in required if c not in df.columns]
+if raw is not None:
+    raw.columns = [COLUMN_MAP.get(str(c).strip().lower(), str(c).strip()) for c in raw.columns]
+    missing = [c for c in ["Date", "Task"] if c not in raw.columns]
 
     if missing:
-        st.error(f"Your data is missing these columns: {', '.join(missing)}")
-    else:
-        st.success(f"✅ Loaded {len(df)} tasks!")
+        st.error(f"Missing columns: {', '.join(missing)}. Expected headers like 'Date' and 'To do list/Work'.")
+        st.stop()
 
-        st.subheader("⚙️ Step 3: Set Your Day")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            hours = st.slider("Available working hours today", 1.0, 12.0, 6.0, 0.5)
-        with col_b:
-            start = st.time_input("Start time", value=datetime.strptime("09:00", "%H:%M").time())
+    for col in ["Vendor", "Category", "Owner", "Region", "Remarks1", "Remarks2", "Status", "Summary"]:
+        if col not in raw.columns:
+            raw[col] = ""
+    raw = raw.dropna(subset=["Task"]).fillna("")
+    raw["State"] = raw.apply(clean_status, axis=1)
 
-        start_dt = datetime.combine(datetime.today(), start)
-        plan, used = build_plan(df, int(hours * 60), start_dt)
+    done_count = int((raw["State"] == "Completed").sum())
+    pending = raw[raw["State"] != "Completed"].copy()
+    st.success(f"✅ Loaded {len(raw)} tasks: {len(pending)} open, {done_count} completed (excluded from plan).")
 
-        st.subheader("🎯 Your Prioritized Plan")
+    st.subheader("⚙️ Step 2: Set Your Day")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        hours = st.slider("Available working hours", 1.0, 12.0, 6.0, 0.5)
+    with c2:
+        start = st.time_input("Start time", value=datetime.strptime("09:00", "%H:%M").time())
+    with c3:
+        as_of = st.date_input("Plan as of date", value=datetime.today())
 
-        today_tasks = plan[plan["Status"] == "✅ Do Today"]
-        deferred = plan[plan["Status"] == "⏭️ Defer"]
+    owners = sorted({o.strip() for o in pending["Owner"] if str(o).strip()})
+    chosen = st.multiselect("Filter by owner / initiative (leave empty for all)", owners)
+    if chosen:
+        pending = pending[pending["Owner"].str.strip().isin(chosen)]
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Tasks Today", len(today_tasks))
-        m2.metric("Deferred", len(deferred))
-        m3.metric("Time Planned", f"{used} / {int(hours * 60)} min")
+    if pending.empty:
+        st.info("No open tasks to plan 🎉")
+        st.stop()
 
-        show_cols = ["Rank", "Task", "Priority", "Due_Date", "Estimated_Minutes",
-                     "Score", "Status", "Start", "End"]
-        if "Category" in plan.columns:
-            show_cols.insert(3, "Category")
+    plan, used = build_plan(pending, as_of, int(hours * 60), datetime.combine(datetime.today(), start))
 
-        st.dataframe(plan[show_cols], use_container_width=True, hide_index=True)
+    bad_dates = int((plan["Date"] == "invalid date").sum())
+    if bad_dates:
+        st.warning(f"{bad_dates} task(s) have an invalid date (e.g. 29/02/25 does not exist, because 2025 is not a leap year). "
+                   "They are scored with a neutral age. Please fix them in the sheet.")
 
-        if len(today_tasks) > 0:
-            st.subheader("🗓️ Today's Schedule")
-            for _, r in today_tasks.iterrows():
-                st.write(f"**{r['Start']} – {r['End']}** → {r['Task']}  ·  _{r['Priority']}_")
+    today_tasks = plan[plan["Plan"] == "✅ Do Today"]
+    deferred = plan[plan["Plan"] == "⏭️ Defer"]
 
-        if len(deferred) > 0:
-            st.warning("These tasks did not fit in today's time: "
-                       + ", ".join(deferred["Task"].tolist()))
+    st.subheader("🎯 Your Prioritized Plan")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Tasks Today", len(today_tasks))
+    m2.metric("Deferred", len(deferred))
+    m3.metric("Time Planned", f"{used} / {int(hours * 60)} min")
 
-        st.download_button(
-            "⬇️ Download Prioritized Plan",
-            data=plan[show_cols].to_csv(index=False),
-            file_name="prioritized_plan.csv",
-            mime="text/csv"
-        )
+    show = ["Rank", "Task", "Vendor", "Owner", "Category", "Date", "Age_Days", "State",
+            "Priority", "Score", "Est_Min", "Plan", "Start", "End", "Remarks1"]
+    st.dataframe(plan[show], use_container_width=True, hide_index=True)
+
+    if len(today_tasks):
+        st.subheader("🗓️ Today's Schedule")
+        for _, r in today_tasks.iterrows():
+            who = f" · {r['Owner']}" if str(r["Owner"]).strip() else ""
+            st.write(f"**{r['Start']} – {r['End']}** → {r['Task']}  ·  _{r['Priority']}_{who}")
+
+    if len(deferred):
+        st.warning("Did not fit today: " + "; ".join(deferred["Task"].tolist()))
+
+    st.download_button("⬇️ Download Plan", plan[show].to_csv(index=False),
+                       file_name="prioritized_plan.csv", mime="text/csv")
 else:
     st.info("👆 Paste a Google Sheet link or upload a CSV to get started.")
