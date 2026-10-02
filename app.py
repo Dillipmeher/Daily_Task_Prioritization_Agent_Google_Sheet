@@ -5,34 +5,43 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Procurement Task Prioritizer", page_icon="📋", layout="wide")
 st.title("📋 Daily Task Prioritization Agent")
-st.write("Load your procurement to-do sheet and get a prioritized plan for today.")
+st.write("Load your task sheet and get a prioritized plan for today.")
 
-# ---------- Column names in your sheet -> internal names ----------
+# ---------- Header mapping (case and spaces ignored) ----------
 COLUMN_MAP = {
     "date": "Date",
+    "task": "Task",
     "to do list/work": "Task",
-    "vendor": "Vendor",
-    "category": "Category",
-    "initative": "Owner",       # your sheet's spelling
+    "owner": "Owner",
+    "initative": "Owner",
     "initiative": "Owner",
+    "category": "Category",
     "region/brand": "Region",
     "remarks-1": "Remarks1",
     "remarks-2": "Remarks2",
+    "priority": "Priority",
     "completion/pending": "Status",
     "summary": "Summary",
+    "estimated_minutes": "Estimated_Minutes",
 }
 
-# ---------- Scoring rules (edit these to suit your work) ----------
-# (keywords, priority points, default minutes) - the first match wins
+# ---------- Scoring rules (edit to suit your work) ----------
+PRIORITY_POINTS = {"high": 40, "medium": 25, "low": 10}
+
+# (keywords, extra points, default minutes) - first match wins
 RULES = [
-    (["quality", "complaint"], 30, 45),
-    (["supply", "short receive", "credit note"], 30, 30),
-    (["payment", "invoice", "billing", "booking"], 30, 20),
-    (["price", "pricing", "priceing", "comparison", "oil"], 20, 40),
-    (["vendor code", "creation", "certificate", "gst", "data update"], 15, 20),
-    (["distributor", "required"], 15, 30),
+    (["quality", "complaint"], 10, 45),
+    (["supply", "short receive", "credit note"], 10, 30),
+    (["payment", "invoice", "billing", "booking"], 10, 20),
+    (["price", "pricing", "comparison", "oil"], 5, 40),
+    (["gst", "data update", "certificate", "fssai", "vendor code"], 5, 20),
+    (["distributor", "required"], 5, 30),
 ]
-DEFAULT_POINTS, DEFAULT_MINUTES = 10, 30
+DEFAULT_POINTS, DEFAULT_MINUTES = 0, 30
+
+URGENT_WORDS = r"urg|ureg|asap|today|immediate"
+LATER_WORDS = r"later|next week|not urgent|postpone"
+QUICK_WORDS = r"less time|quick|short task|few minutes"
 
 
 def task_rule(row):
@@ -45,27 +54,34 @@ def task_rule(row):
 
 def age_points(age_days):
     if pd.isna(age_days):
-        return 10
-    if age_days >= 30:
-        return 50
-    if age_days >= 14:
-        return 40
+        return 0
     if age_days >= 7:
         return 30
     if age_days >= 3:
         return 20
-    if age_days >= 0:
+    if age_days >= 1:
         return 10
     return 0
 
 
-def clean_status(row):
-    text = f"{row.get('Status', '')} {row.get('Summary', '')}".lower()
-    if re.search(r"comp|done|closed", text):
+def clean_status(value):
+    t = str(value).strip().lower()
+    if re.search(r"\b(comp\w*|done|closed|finished)\b", t):
         return "Completed"
-    if "wip" in text or "progress" in text:
+    if "wip" in t or "progress" in t:
         return "WIP"
     return "Pending"
+
+
+def clean_priority(value):
+    t = str(value).strip().lower()
+    if t.startswith("h"):
+        return "High"
+    if t.startswith("m"):
+        return "Medium"
+    if t.startswith("l"):
+        return "Low"
+    return "Medium"  # blank or unknown
 
 
 # ---------- Google Sheet helpers ----------
@@ -112,23 +128,50 @@ else:
 def build_plan(df, as_of, available_minutes, start_time):
     df = df.copy()
 
-    # Dates are dd/mm/yy in your sheet
+    # Dates are dd/mm/yy
     d = pd.to_datetime(df["Date"], format="%d/%m/%y", errors="coerce")
     fallback = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     df["Date_parsed"] = d.fillna(fallback)
     df["Age_Days"] = (pd.Timestamp(as_of) - df["Date_parsed"]).dt.days
 
     rules = df.apply(task_rule, axis=1, result_type="expand")
-    df["Task_Points"] = rules[0]
-    if "Estimated_Minutes" in df.columns:
-        df["Est_Min"] = pd.to_numeric(df["Estimated_Minutes"], errors="coerce").fillna(rules[1])
-    else:
-        df["Est_Min"] = rules[1]
-
+    df["Type_Points"] = rules[0]
+    df["Priority_Points"] = df["Priority"].str.lower().map(PRIORITY_POINTS)
     df["Age_Points"] = df["Age_Days"].apply(age_points)
     df["WIP_Bonus"] = (df["State"] == "WIP").astype(int) * 5
-    df["Score"] = df["Task_Points"] + df["Age_Points"] + df["WIP_Bonus"]
-    df["Priority"] = pd.cut(df["Score"], [-1, 44, 69, 1000], labels=["Low", "Medium", "High"])
+
+    summary = df["Summary"].astype(str).str.lower()
+    urgent = summary.str.contains(URGENT_WORDS, regex=True)
+    later = summary.str.contains(LATER_WORDS, regex=True) & ~urgent
+    quick = summary.str.contains(QUICK_WORDS, regex=True)
+    df["Note_Points"] = urgent.astype(int) * 25 - later.astype(int) * 20
+
+    # Minutes: your Estimated_Minutes column if present, else quick note, else guess by type
+    est = rules[1].astype(float)
+    est[quick] = 15
+    if "Estimated_Minutes" in df.columns:
+        est = pd.to_numeric(df["Estimated_Minutes"], errors="coerce").fillna(est)
+    df["Est_Min"] = est.astype(int)
+
+    df["Score"] = (df["Priority_Points"] + df["Type_Points"] + df["Age_Points"]
+                   + df["WIP_Bonus"] + df["Note_Points"])
+
+    # Plain-language explanation for each row
+    why = []
+    for i, r in df.iterrows():
+        parts = [f"{r['Priority']} priority"]
+        if pd.notna(r["Age_Days"]) and r["Age_Days"] >= 3:
+            parts.append(f"{int(r['Age_Days'])} days old")
+        if r["State"] == "WIP":
+            parts.append("already in progress")
+        if urgent[i]:
+            parts.append("marked urgent in Summary")
+        if later[i]:
+            parts.append("marked 'later' in Summary")
+        if quick[i]:
+            parts.append("quick task")
+        why.append(", ".join(parts))
+    df["Why"] = why
 
     df = df.sort_values(["Score", "Est_Min"], ascending=[False, True]).reset_index(drop=True)
     df.insert(0, "Rank", df.index + 1)
@@ -156,20 +199,22 @@ def build_plan(df, as_of, available_minutes, start_time):
 if raw is not None:
     raw.columns = [COLUMN_MAP.get(str(c).strip().lower(), str(c).strip()) for c in raw.columns]
     missing = [c for c in ["Date", "Task"] if c not in raw.columns]
-
     if missing:
-        st.error(f"Missing columns: {', '.join(missing)}. Expected headers like 'Date' and 'To do list/Work'.")
+        st.error(f"Missing columns: {', '.join(missing)}")
         st.stop()
 
-    for col in ["Vendor", "Category", "Owner", "Region", "Remarks1", "Remarks2", "Status", "Summary"]:
+    for col in ["Owner", "Category", "Region", "Remarks1", "Priority", "Status", "Summary"]:
         if col not in raw.columns:
             raw[col] = ""
     raw = raw.dropna(subset=["Task"]).fillna("")
-    raw["State"] = raw.apply(clean_status, axis=1)
+    raw = raw[raw["Task"].astype(str).str.strip() != ""]
+
+    raw["State"] = raw["Status"].apply(clean_status)
+    raw["Priority"] = raw["Priority"].apply(clean_priority)
 
     done_count = int((raw["State"] == "Completed").sum())
     pending = raw[raw["State"] != "Completed"].copy()
-    st.success(f"✅ Loaded {len(raw)} tasks: {len(pending)} open, {done_count} completed (excluded from plan).")
+    st.success(f"✅ Loaded {len(raw)} tasks: {len(pending)} open, {done_count} completed (excluded).")
 
     st.subheader("⚙️ Step 2: Set Your Day")
     c1, c2, c3 = st.columns(3)
@@ -180,10 +225,10 @@ if raw is not None:
     with c3:
         as_of = st.date_input("Plan as of date", value=datetime.today())
 
-    owners = sorted({o.strip() for o in pending["Owner"] if str(o).strip()})
-    chosen = st.multiselect("Filter by owner / initiative (leave empty for all)", owners)
+    owners = sorted({o.strip() for o in pending["Owner"].astype(str) if o.strip()})
+    chosen = st.multiselect("Filter by owner / vendor (leave empty for all)", owners)
     if chosen:
-        pending = pending[pending["Owner"].str.strip().isin(chosen)]
+        pending = pending[pending["Owner"].astype(str).str.strip().isin(chosen)]
 
     if pending.empty:
         st.info("No open tasks to plan 🎉")
@@ -191,10 +236,9 @@ if raw is not None:
 
     plan, used = build_plan(pending, as_of, int(hours * 60), datetime.combine(datetime.today(), start))
 
-    bad_dates = int((plan["Date"] == "invalid date").sum())
-    if bad_dates:
-        st.warning(f"{bad_dates} task(s) have an invalid date (e.g. 29/02/25 does not exist, because 2025 is not a leap year). "
-                   "They are scored with a neutral age. Please fix them in the sheet.")
+    bad = int((plan["Date"] == "invalid date").sum())
+    if bad:
+        st.warning(f"{bad} task(s) have an invalid date. Please fix them in the sheet (format dd/mm/yy).")
 
     today_tasks = plan[plan["Plan"] == "✅ Do Today"]
     deferred = plan[plan["Plan"] == "⏭️ Defer"]
@@ -205,8 +249,8 @@ if raw is not None:
     m2.metric("Deferred", len(deferred))
     m3.metric("Time Planned", f"{used} / {int(hours * 60)} min")
 
-    show = ["Rank", "Task", "Vendor", "Owner", "Category", "Date", "Age_Days", "State",
-            "Priority", "Score", "Est_Min", "Plan", "Start", "End", "Remarks1"]
+    show = ["Rank", "Task", "Owner", "Category", "Date", "Age_Days", "State", "Priority",
+            "Score", "Est_Min", "Plan", "Start", "End", "Why", "Remarks1", "Summary"]
     st.dataframe(plan[show], use_container_width=True, hide_index=True)
 
     if len(today_tasks):
